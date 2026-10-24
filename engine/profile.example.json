@@ -1,0 +1,35 @@
+{
+  "interests": [
+    "AI 编程",
+    "大模型应用",
+    "Python 工程实践"
+  ],
+  "must_include_any": [],
+  "exclude": [
+    "搬运",
+    "广告",
+    "合集",
+    "直播回放"
+  ],
+  "min_duration": 120,
+  "max_duration": 3600,
+  "platforms": [
+    "bilibili"
+  ],
+  "queries_per_brief": 5,
+  "results_per_query": 20,
+  "deep_ingest_top": 3,
+  "whisper_model": "small",
+  "ocr": {
+    "scene_threshold": 0.25,
+    "max_frames": 24,
+    "min_conf": 0.5
+  },
+  "score_weights": {
+    "play": 1,
+    "like": 0.6,
+    "recency": 0.5,
+    "interest": 1.5,
+    "duration": 1
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "dsh-forage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "description": "采源 Forage — 视频知识采集（薄插件 + Python 引擎）",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikejikichen/dsh-forage.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "video",
+    "knowledge",
+    "bilibili",
+    "transcript",
+    "ocr"
+  ]
+}

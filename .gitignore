@@ -1,0 +1,10 @@
+node_modules/
+__pycache__/
+*.pyc
+*.log
+*.bundle
+media/
+data/
+frames/
+models/
+.DS_Store
