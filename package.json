@@ -17,7 +17,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mikejikichen/dsh-forage.git"
+    "url": "git+https://github.com/a3079566007-pixel/dsh-forage.git"
   },
   "keywords": [
     "dsh",
@@ -27,5 +27,9 @@
     "bilibili",
     "transcript",
     "ocr"
-  ]
+  ],
+  "homepage": "https://github.com/a3079566007-pixel/dsh-forage#readme",
+  "bugs": {
+    "url": "https://github.com/a3079566007-pixel/dsh-forage/issues"
+  }
 }

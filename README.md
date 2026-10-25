@@ -1,5 +1,9 @@
 # dsh-forage · 采源
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![npm](https://img.shields.io/badge/package-0.1.0-blue)](package.json)
+
+
 把视频"采"成可检索的知识：快扫候选、精选深采、转写口播、抽帧 OCR、写回摘要、本地模糊检索。
 
 > **Forage**（v. 觅食、采集）——像觅食一样在视频流里挑有用的东西，而不是把整个平台搬回家。

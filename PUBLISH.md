@@ -16,7 +16,7 @@
 
 ```powershell
 $git = "$env:USERPROFILE\.dsh\tools\mingit\cmd\git.exe"
-& $git -C "$env:USERPROFILE\.dsh\repos\dsh-forage" remote add origin https://github.com/mikejikichen/dsh-forage.git
+& $git -C "$env:USERPROFILE\.dsh\repos\dsh-forage" remote add origin https://github.com/a3079566007-pixel/dsh-forage.git
 & $git -C "$env:USERPROFILE\.dsh\repos\dsh-forage" push -u origin main
 ```
 
@@ -29,7 +29,7 @@ $git = "$env:USERPROFILE\.dsh\tools\mingit\cmd\git.exe"
 ## 发布到 Gitee（备选，国内直连可用）
 
 ```powershell
-& $git -C "$env:USERPROFILE\.dsh\repos\dsh-forage" remote add origin https://gitee.com/mikejikichen/dsh-forage.git
+& $git -C "$env:USERPROFILE\.dsh\repos\dsh-forage" remote add origin https://gitee.com/a3079566007-pixel/dsh-forage.git
 & $git -C "$env:USERPROFILE\.dsh\repos\dsh-forage" push -u origin main
 ```
 
