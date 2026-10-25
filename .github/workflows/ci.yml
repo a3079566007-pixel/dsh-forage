@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Validate plugin manifest and scripts
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('package.json','utf8'))"
+          node --check lib/index.js
+          node --check lib/schemas.js
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile engine
+        run: python -m py_compile engine/harvest.py
+      - name: Check tool schemas
+        run: node --input-type=module -e "import('./lib/schemas.js').then(m => { if (!Array.isArray(m.TOOLS) || m.TOOLS.length !== 7) process.exit(1); console.log('tools:', m.TOOLS.map(t => t.name).join(',')); })"
