@@ -1,0 +1,128 @@
+# 采源验收标准库（rubric catalog）
+# 用途：不同视频类型用不同判据；自动项由 engine audit 计算，判定项由模型按说明打分（0-5）。
+version: 1
+
+common:
+  - id: transcript
+    name: 转写完整
+    kind: auto
+    desc: 有转写且长度 ≥ 800 字符（约 3 分钟以上口播）
+  - id: summary_sections
+    name: 摘要五要素
+    kind: auto
+    desc: 含 一句话结论 / 核心要点 / 关键图文 / 坑与前提 / 原文锚点
+  - id: ocr
+    name: 画面文字覆盖
+    kind: auto
+    desc: 有抽帧且 OCR ≥ 5 行；无抽帧记为 n/a
+  - id: cost
+    name: 单条成本
+    kind: auto
+    desc: 媒体 ≤ 80 MB，时长在 profile 窗口内
+  - id: accuracy
+    name: 事实准确
+    kind: judged
+    desc: 抽 5 个要点回对转写，错误 ≤1
+  - id: fidelity
+    name: 忠于原意
+    kind: judged
+    desc: 不把自己的推断写成本片结论；推断需标注
+
+types:
+  concept:
+    label: 概念讲解
+    criteria:
+      - id: definition
+        name: 定义准确
+        kind: judged
+        desc: 核心概念的定义无错、边界条件说清
+      - id: contrast
+        name: 邻近概念区分
+        kind: judged
+        desc: 与容易混淆的概念做了对比（如 RAG vs 微调）
+      - id: analogy
+        name: 类比是否误导
+        kind: judged
+        desc: 类比不引入错误直觉
+  tutorial:
+    label: 实战教程
+    criteria:
+      - id: prerequisites
+        name: 前置条件
+        kind: judged
+        desc: 版本、依赖、账号、数据准备写清
+      - id: steps
+        name: 步骤可复现
+        kind: judged
+        desc: 命令/代码/参数完整，能照着跑
+      - id: pitfalls
+        name: 坑与验证
+        kind: judged
+        desc: 给出常见报错与结果验证方式
+  survey:
+    label: 论文综述
+    criteria:
+      - id: coverage
+        name: 覆盖度
+        kind: judged
+        desc: 代表工作与时间线覆盖完整，无关键遗漏
+      - id: taxonomy
+        name: 分类框架
+        kind: judged
+        desc: 给出可复用的分类维度
+      - id: open_issues
+        name: 争议与未解
+        kind: judged
+        desc: 说明分歧、局限与开放问题
+  interview:
+    label: 面试/问答
+    criteria:
+      - id: layering
+        name: 答题分层
+        kind: judged
+        desc: 有及格/良好/优秀的层次差别
+      - id: traps
+        name: 常见误区
+        kind: judged
+        desc: 点出容易答错或答浅的点
+      - id: framework
+        name: 可背诵框架
+        kind: judged
+        desc: 给出结构化答题骨架
+  review:
+    label: 工具/方案评测
+    criteria:
+      - id: dimensions
+        name: 对比维度
+        kind: judged
+        desc: 维度明确、口径一致
+      - id: cost
+        name: 成本与限制
+        kind: judged
+        desc: 给出价格/资源/限制
+      - id: alternatives
+        name: 替代方案
+        kind: judged
+        desc: 说明什么场景该选别的
+  opinion:
+    label: 观点/新闻解读
+    criteria:
+      - id: fact_opinion
+        name: 事实与观点分离
+        kind: judged
+        desc: 事实有来源，观点有标记
+      - id: timeliness
+        name: 时效
+        kind: judged
+        desc: 信息与当前版本/时间线相符
+  course:
+    label: 课程/合集
+    criteria:
+      - id: outline
+        name: 大纲完整
+        kind: judged
+        desc: 有目录与章节目标
+      - id: standalone
+        name: 单集独立性
+        kind: judged
+        desc: 单集能独立看懂，依赖前集时说明

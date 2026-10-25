@@ -721,6 +721,100 @@ def cmd_status(a) -> None:
     emit({"ok": True, "total": total, "byStatus": by, "running": running, "db": str(DB_PATH)})
 
 
+def load_rubrics() -> dict:
+    import yaml
+    path = Path(__file__).parent / "rubrics.yaml"
+    if not path.exists():
+        return {"common": [], "types": {}}
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {"common": [], "types": {}}
+
+
+def classify_video(title: str, desc: str) -> str:
+    text = (title + " " + (desc or "")).lower()
+    if any(k in text for k in ["面试", "高频题", "八股", "答题"]):
+        return "interview"
+    if any(k in text for k in ["综述", "论文", "survey", "篇论文", "研究进展"]):
+        return "survey"
+    if any(k in text for k in ["评测", "测评", "横评", "对比", "哪个好"]):
+        return "review"
+    if any(k in text for k in ["合集", "全集", "全套", "系统课", "课程", "第几期", "期"]):
+        return "course"
+    if any(k in text for k in ["教程", "实战", "手把手", "搭建", "部署", "项目", "入门到", "速成"]):
+        return "tutorial"
+    if any(k in text for k in ["为什么", "观点", "解读", "新闻", "热点", "思考"]):
+        return "opinion"
+    return "concept"
+
+
+def media_size(vid: str) -> int:
+    d = MEDIA / re.sub(r"[^A-Za-z0-9_.-]", "_", vid)
+    if not d.exists():
+        return 0
+    total = 0
+    for p in d.rglob("*"):
+        if p.is_file():
+            total += p.stat().st_size
+    return total
+
+
+def auto_checks(row) -> dict:
+    checks = {}
+    trans = row["transcript"] or ""
+    checks["transcript"] = (len(trans) >= 800, str(len(trans)) + " 字符")
+    summary = row["summary"] or ""
+    secs = ["一句话结论", "核心要点", "坑与前提"]
+    present = sum(1 for s in secs if s in summary)
+    if "图文" in summary or "画面文字" in summary:
+        present += 1
+    if "锚点" in summary or "原文锚点" in summary:
+        present += 1
+    checks["summary_sections"] = (present >= 5, str(present) + "/5")
+    ocr = row["ocr_text"] or ""
+    ocr_lines = len([x for x in ocr.splitlines() if x.strip()])
+    if row["frames_dir"]:
+        checks["ocr"] = (ocr_lines >= 5, str(ocr_lines) + " 行")
+    else:
+        checks["ocr"] = (True, "n/a（未抽帧）")
+    size_mb = media_size(row["id"]) / 1048576.0
+    dur = row["duration"] or 0
+    ok_cost = size_mb <= 80 and 120 <= dur <= 3600
+    checks["cost"] = (ok_cost, str(round(size_mb, 1)) + " MB / " + str(dur) + "s")
+    return checks
+
+
+def cmd_audit(a) -> None:
+    rub = load_rubrics()
+    conn = db()
+    if a.ids:
+        rows = [conn.execute("SELECT * FROM videos WHERE id=?", (vid,)).fetchone() for vid in a.ids]
+        rows = [r for r in rows if r]
+    else:
+        status = a.status
+        rows = conn.execute("SELECT * FROM videos WHERE status=? ORDER BY score DESC LIMIT ?", (status, a.limit)).fetchall()
+    if not rows:
+        print("(no rows)")
+        return
+    summary = []
+    for r in rows:
+        vtype = classify_video(r["title"], r["description"])
+        type_cfg = (rub.get("types") or {}).get(vtype, {})
+        checks = auto_checks(r)
+        passed = sum(1 for ok, _ in checks.values() if ok)
+        total = len(checks)
+        print("## " + r["title"][:60])
+        print("类型: " + vtype + "（" + str(type_cfg.get("label", "")) + "） | 自动项 " + str(passed) + "/" + str(total))
+        for cid, (ok, detail) in checks.items():
+            print("  [" + ("PASS" if ok else "FAIL") + "] " + cid + ": " + detail)
+        judged = [c for c in (rub.get("common") or []) if c.get("kind") == "judged"]
+        judged += [c for c in (type_cfg.get("criteria") or []) if c.get("kind") == "judged"]
+        print("  待模型判定: " + ", ".join(c["id"] + "(" + c["name"] + ")" for c in judged))
+        print("")
+        summary.append((vtype, passed, total))
+    print("----")
+    print("汇总: " + str(len(summary)) + " 条；自动项全过 " + str(sum(1 for _, p, t in summary if p == t)) + " 条")
+    conn.close()
+
+
 def cmd_pass(a) -> None:
     conn = db()
     if not conn.execute("SELECT 1 FROM videos WHERE id=?", (a.id,)).fetchone():
@@ -834,6 +928,12 @@ def main() -> None:
     sp.add_argument("--status", default="new")
     sp.add_argument("--limit", type=int, default=30)
     sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("audit", help="按类型 rubric 做验收自检")
+    sp.add_argument("--ids", nargs="*")
+    sp.add_argument("--status", default="summarized")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.set_defaults(func=cmd_audit)
 
     sp = sub.add_parser("pass", help="反馈：喜欢/跳过")
     sp.add_argument("--id", required=True)
