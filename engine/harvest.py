@@ -320,11 +320,11 @@ def extract_frames(video: Path, outdir: Path, threshold: float, max_frames: int)
     cp = run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video),
               "-vf", vf, "-vsync", "vfr", "-frames:v", str(max_frames), pattern])
     frames = sorted(outdir.glob("f_*.jpg"))
-    if len(frames) < 3:
+    if len(frames) < 8:
         for old in frames:
             old.unlink()
         cp = run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video),
-                  "-vf", "fps=1/20,scale=1280:-2", "-frames:v", str(min(max_frames, 12)), pattern])
+                  "-vf", "fps=1/45,scale=1920:-2", "-frames:v", str(max_frames), pattern])
         frames = sorted(outdir.glob("f_*.jpg"))
     return unique_frames(frames)
 
@@ -510,30 +510,43 @@ def _fuzzy(conn, q: str, limit: int):
 
 
 def kb_rows(conn, q: str, limit: int):
-    rows = []
+    """带权重的本地检索：摘要/转写优先，标题只作辅助；要求词覆盖或二元组覆盖。"""
     tokens = [x for x in re.split(r"\s+", q.strip()) if x]
-    try:
-        fts_q = " AND ".join('"' + t.replace('"', "") + '"' for t in tokens)
-        rows = conn.execute("""SELECT v.*, snippet(videos_fts, 1, '[', ']', '…', 16) AS snip
-                               FROM videos_fts JOIN videos v ON v.id = videos_fts.id
-                               WHERE videos_fts MATCH ? ORDER BY rank LIMIT ?""", (fts_q, limit)).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
-    if not rows:
-        clause = " OR ".join(["(title LIKE ? OR description LIKE ? OR transcript LIKE ? OR ocr_text LIKE ? OR summary LIKE ?)"] * len(tokens))
-        params = []
-        for tok in tokens:
-            params += [f"%{tok}%"] * 5
-        rows = conn.execute(f"SELECT *, substr(coalesce(transcript,''),1,120) AS snip FROM videos WHERE {clause} ORDER BY score DESC LIMIT ?",
-                            (*params, limit)).fetchall()
-    if not rows:
-        picked = []
-        for item in _fuzzy(conn, q, limit):
-            d = item if isinstance(item, dict) else dict(zip(item.keys(), item))
-            d["snip"] = (d.get("transcript") or d.get("summary") or "")[:120]
-            picked.append(d)
-        rows = picked
-    return rows
+    base = re.sub(r"\s+", "", q)
+    shingles = list(dict.fromkeys(base[i:i + 2] for i in range(len(base) - 1))) if len(base) >= 2 else []
+    rows = conn.execute("SELECT * FROM videos").fetchall()
+    scored = []
+    for r in rows:
+        summary = r["summary"] or ""
+        trans = r["transcript"] or ""
+        ocr = r["ocr_text"] or ""
+        title = r["title"] or ""
+        desc = r["description"] or ""
+        strong = summary + " " + trans + " " + ocr
+        weak = title + " " + desc
+        token_hits = sum(1 for tok in tokens if tok in strong or tok in weak)
+        sh_hits = sum(1 for s in shingles if s in strong or s in weak)
+        cov = (sh_hits / len(shingles)) if shingles else 0.0
+        if not (token_hits == len(tokens) or cov >= 0.5):
+            continue
+        score = (token_hits / max(len(tokens), 1)) * 3.0 + cov * 2.0
+        if summary:
+            score += 1.5
+        score += min(math.log1p(r["play"] or 0) / 20.0, 0.5)
+        scored.append((score, r))
+    scored.sort(key=lambda x: -x[0])
+    out = []
+    for _, r in scored[:limit]:
+        d = dict(zip(r.keys(), r))
+        src = d.get("summary") or d.get("transcript") or ""
+        pos = -1
+        for needle in tokens + shingles:
+            pos = src.find(needle)
+            if pos >= 0:
+                break
+        d["snip"] = src[max(0, pos - 30):pos + 110] if pos >= 0 else src[:120]
+        out.append(d)
+    return out
 
 
 def search_kb(q: str, limit: int) -> None:
