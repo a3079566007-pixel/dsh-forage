@@ -61,8 +61,12 @@ def profile() -> dict:
 
 def db() -> sqlite3.Connection:
     DATA.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS videos (
         id TEXT PRIMARY KEY, platform TEXT, bvid TEXT, url TEXT,
@@ -274,7 +278,7 @@ def transcribe(audio: Path, model_name: str) -> tuple[str, list[dict]]:
     os.environ.setdefault("HF_HOME", str(HOME / "models"))
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=4)
     audio_array = decode_to_array(audio)
     segments, info = model.transcribe(audio_array, language="zh", vad_filter=True, beam_size=1)
     lines, cues = [], []
@@ -316,17 +320,61 @@ def extract_frames(video: Path, outdir: Path, threshold: float, max_frames: int)
     for old in outdir.glob("*.jpg"):
         old.unlink()
     pattern = str(outdir / "f_%03d.jpg")
-    vf = f"select='gt(scene,{threshold})',scale=1920:-2"
+    vf = f"select='gt(scene,{min(threshold, 0.18)})',scale=1920:-2"
     cp = run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video),
-              "-vf", vf, "-vsync", "vfr", "-frames:v", str(max_frames), pattern])
+              "-vf", vf, "-vsync", "vfr", "-frames:v", str(max(max_frames, 40)), pattern])
     frames = sorted(outdir.glob("f_*.jpg"))
-    if len(frames) < 8:
+    if len(frames) < 12:
         for old in frames:
             old.unlink()
         cp = run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video),
-                  "-vf", "fps=1/45,scale=1920:-2", "-frames:v", str(max_frames), pattern])
+                  "-vf", "fps=1/25,scale=1920:-2", "-frames:v", str(max_frames), pattern])
         frames = sorted(outdir.glob("f_*.jpg"))
     return unique_frames(frames)
+
+
+def classify_frame(path: Path, ocr_lines: int) -> str:
+    import cv2
+    import numpy as np
+    img = cv2.imread(str(path))
+    if img is None:
+        return "unknown"
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 80, 160)
+    edge_ratio = float(edges.mean()) / 255.0
+    faces = ()
+    try:
+        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        if not cascade.empty():
+            faces = cascade.detectMultiScale(gray, 1.1, 4)
+    except Exception:
+        faces = ()
+    if len(faces) and ocr_lines < 4:
+        return "face"
+    if ocr_lines >= 10:
+        return "code/text"
+    if ocr_lines >= 3 and edge_ratio < 0.05:
+        return "slide"
+    if edge_ratio >= 0.03:
+        return "diagram"
+    return "other"
+
+
+def write_manifest(work: Path, frames: list[Path], per_frame: list[dict]) -> Path:
+    texts = {x["frame"]: x["text"] for x in per_frame}
+    items = []
+    for i, fp in enumerate(frames):
+        lines = texts.get(fp.name, [])
+        items.append({
+            "file": fp.name,
+            "index": i,
+            "approx_second": i * 25,
+            "type": classify_frame(fp, len(lines)),
+            "ocr": lines[:12],
+        })
+    out = work / "frames" / "manifest.json"
+    out.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out
 
 
 def ocr_frames(frames: list[Path], min_conf: float) -> tuple[str, list[dict]]:
@@ -408,15 +456,16 @@ def ingest(vid: str, asr: bool = True, frames: bool = False, model: str | None =
         video = download_video(url, work)
         cfg = profile().get("ocr", {})
         fdir = work / "frames"
-        fs = extract_frames(video, fdir, float(cfg.get("scene_threshold", 0.25)), int(cfg.get("max_frames", 24)))
-        print(f"[ingest] {len(fs)} 帧，OCR ...")
-        text, per = ocr_frames(fs, float(cfg.get("min_conf", 0.5)))
+        frames_list = extract_frames(video, fdir, float(cfg.get("scene_threshold", 0.25)), int(cfg.get("max_frames", 24)))
+        print(f"[ingest] {len(frames_list)} 帧，OCR ...")
+        text, per = ocr_frames(frames_list, float(cfg.get("min_conf", 0.5)))
         (work / "ocr.txt").write_text(text, encoding="utf-8")
         (work / "ocr.json").write_text(json.dumps(per, ensure_ascii=False), encoding="utf-8")
+        manifest = write_manifest(work, frames_list, per)
         conn.execute("UPDATE videos SET ocr_text=?, frames_dir=? WHERE id=?", (text, str(fdir), vid))
         conn.commit()
 
-    conn.execute("UPDATE videos SET status=CASE WHEN status='new' THEN 'ingested' ELSE status END WHERE id=?", (vid,))
+    conn.execute("UPDATE videos SET status='ingested' WHERE id=? AND status IN ('new','ingesting')", (vid,))
     conn.commit()
     fts_sync(conn, vid)
     conn.close()
@@ -450,6 +499,18 @@ def digest(vid: str, max_chars: int, quiet: bool = False) -> str:
     ]
     if r["transcript"]:
         parts += ["", f"## 文案转写 ({r['transcript_src'] or 'unknown'})", r["transcript"][:max_chars]]
+    if r["frames_dir"]:
+        man = Path(r["frames_dir"]) / "manifest.json"
+        if man.exists():
+            try:
+                items = json.loads(man.read_text(encoding="utf-8"))
+                lines = ["", "## 图文资产（" + str(len(items)) + " 帧）"]
+                for it in items[:24]:
+                    snippet = " / ".join(it.get("ocr", []))[:60]
+                    lines.append("- [" + it.get("type", "") + "] t≈" + str(it.get("approx_second", 0)) + "s " + snippet + " (" + str(Path(r["frames_dir"]) / it["file"]) + ")")
+                parts += lines
+            except Exception:
+                pass
     if r["ocr_text"]:
         parts += ["", "## 画面文字 (OCR)", r["ocr_text"][: max_chars // 2]]
     if r["summary"]:
@@ -815,6 +876,109 @@ def cmd_audit(a) -> None:
     conn.close()
 
 
+TYPE_QUERIES = {
+    "concept": ["原理", "是什么"],
+    "tutorial": ["教程", "实战"],
+    "survey": ["综述", "论文"],
+    "interview": ["面试"],
+    "review": ["对比", "评测"],
+    "course": ["系统课"],
+    "opinion": ["观点"],
+}
+
+
+def cmd_learn(a) -> None:
+    brief = a.brief
+    hours = max(0.25, min(4.0, float(a.hours)))
+    types = [x.strip() for x in (a.types or "concept,tutorial,survey,interview,review").split(",") if x.strip()]
+    target_sec = int(hours * 3600)
+    p = profile()
+    conn = db()
+    queries = []
+    for tp in types:
+        for suffix in TYPE_QUERIES.get(tp, ["教程"]):
+            queries.append(brief + " " + suffix)
+    print("[learn] 目标 " + str(hours) + " 小时；查询 " + str(len(queries)) + " 组")
+    for q in queries:
+        try:
+            rows = bili_search(q, page=1)
+            added, _ = upsert_search(rows, q, p)
+            print("  " + q + " -> +" + str(added))
+        except Exception as e:
+            print("  " + q + " FAILED: " + str(e)[:80])
+    rows = conn.execute("SELECT * FROM videos WHERE status='new' AND duration BETWEEN 180 AND 1800 ORDER BY score DESC").fetchall()
+    keys = [x.lower() for x in re.split(r"\s+", brief) if len(x) >= 2]
+    def relevant(r):
+        text = ((r["title"] or "") + " " + (r["description"] or "") + " " + (r["tags"] or "")).lower()
+        return any(k in text for k in keys) if keys else True
+    by_type = {}
+    for r in rows:
+        if not relevant(r):
+            continue
+        tp = classify_video(r["title"], r["description"])
+        if tp in types:
+            by_type.setdefault(tp, []).append(r)
+    picked, secs = [], 0
+    queues = {tp: list(by_type.get(tp, [])) for tp in types}
+    used = set()
+    while secs < target_sec:
+        progressed = False
+        for tp in types:
+            choice = None
+            for r in queues[tp]:
+                if r["id"] in used:
+                    continue
+                if (r["duration"] or 0) <= max(60, target_sec - secs + 90):
+                    choice = r
+                    break
+            if choice is None:
+                for r in queues[tp]:
+                    if r["id"] not in used:
+                        choice = r
+                        break
+            if choice is not None:
+                used.add(choice["id"])
+                picked.append(choice)
+                secs += choice["duration"] or 0
+                progressed = True
+            if secs >= target_sec:
+                break
+        if not progressed:
+            break
+    plan = {
+        "brief": brief, "hours": hours, "types": types,
+        "selected": [{"id": r["id"], "title": r["title"], "duration": r["duration"], "type": classify_video(r["title"], r["description"])} for r in picked],
+        "total_seconds": secs,
+    }
+    out = Path(a.out) if a.out else (HOME / "learn-plan.json")
+    out.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("[learn] 选中 " + str(len(picked)) + " 条，合计 " + str(round(secs / 60)) + " 分钟；计划写入 " + str(out))
+    for r in picked:
+        print("  [" + classify_video(r["title"], r["description"]) + "] " + str(r["duration"]) + "s " + r["title"][:50])
+    if a.run and picked:
+        import subprocess as sp
+        frame_types = {"tutorial", "course"}
+        with_frames = [r for r in picked if classify_video(r["title"], r["description"]) in frame_types]
+        plain = [r for r in picked if classify_video(r["title"], r["description"]) not in frame_types]
+        groups = []
+        if with_frames:
+            groups.append(([r["id"] for r in with_frames], True))
+        if plain:
+            groups.append(([r["id"] for r in plain], False))
+        procs = []
+        for gi, (ids, want_frames) in enumerate(groups):
+            log = open(HOME / ("learn-worker-" + str(gi) + ".log"), "w", encoding="utf-8")
+            argv = [sys.executable, str(Path(__file__).resolve()), "ingest", "--ids", *ids]
+            if want_frames:
+                argv.append("--frames")
+            proc = sp.Popen(argv, stdout=log, stderr=sp.STDOUT,
+                            env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+            procs.append(proc)
+            print("[learn] worker " + str(gi) + " pid=" + str(proc.pid) + " n=" + str(len(ids)) + (" frames" if want_frames else ""))
+        print("[learn] 后台转写已启动；日志 " + str(HOME / "learn-worker-*.log"))
+    conn.close()
+
+
 def cmd_pass(a) -> None:
     conn = db()
     if not conn.execute("SELECT 1 FROM videos WHERE id=?", (a.id,)).fetchone():
@@ -928,6 +1092,15 @@ def main() -> None:
     sp.add_argument("--status", default="new")
     sp.add_argument("--limit", type=int, default=30)
     sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("learn", help="长学习会话：按类型配额采集 1-4 小时视频并并行转写")
+    sp.add_argument("--brief", required=True)
+    sp.add_argument("--hours", type=float, default=1.0)
+    sp.add_argument("--types", default="concept,tutorial,survey,interview,review")
+    sp.add_argument("--out", default=None)
+    sp.add_argument("--run", action="store_true")
+    sp.add_argument("--workers", type=int, default=3)
+    sp.set_defaults(func=cmd_learn)
 
     sp = sub.add_parser("audit", help="按类型 rubric 做验收自检")
     sp.add_argument("--ids", nargs="*")
