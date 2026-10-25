@@ -1,48 +1,39 @@
 # 发布说明
 
-## 当前状态
+## 当前状态（已发布）
 
-- 本地仓库：`~/.dsh/repos/dsh-forage`，分支 `main`，首个提交 `b210a31`
-- 离线包：`~/.dsh/repos/dsh-forage.bundle`（可 `git clone dsh-forage.bundle dsh-forage`）
-- 打包：`~/.dsh/repos/dsh-forage.zip`
+- 仓库：https://github.com/a3079566007-pixel/dsh-forage （public，默认分支 main）
+- 版本：v0.1.0（tag 已推），Release：https://github.com/a3079566007-pixel/dsh-forage/releases/tag/v0.1.0
+- 话题：dsh / dsh-plugin / deepseek-harness / bilibili / video / knowledge-base / whisper / ocr
 
-## 发布到 GitHub
+## 本机发布方式（已固化，无需重复登录）
 
-本机实测 `github.com:443` 直连超时，且未配置任何 GitHub / Gitee 凭据，因此**推送需要你提供凭据或代理**。
+| 项 | 值 |
+|---|---|
+| GitHub 账号 | a3079566007-pixel（gh 已登录，token 存于 Windows 凭据管理器 keyring） |
+| 推送通道 | SSH over 443：`ssh://git@ssh.github.com:443/a3079566007-pixel/dsh-forage.git` |
+| 私钥 | `~/.ssh/dsh_forage_ed25519`（仓库 Deploy key，读写） |
+| git 凭据助手 | `credential.https://github.com.helper = gh auth git-credential` |
+| 代理 | 全局 `http.https://github.com.proxy = http://127.0.0.1:12450`（仅 HTTPS 走；SSH 推送不需要） |
+| 凭据备份 | `~/.dsh/backups/gh-hosts.yml`（token 本体在 keyring） |
 
-1. 先在网页建空仓库（不要勾选 Initialize README）：
-   https://github.com/new?name=dsh-forage
-2. 在本机执行（PAT 代替密码）：
+以后推送：
 
 ```powershell
 $git = "$env:USERPROFILE\.dsh\tools\mingit\cmd\git.exe"
-& $git -C "$env:USERPROFILE\.dsh\repos\dsh-forage" remote add origin https://github.com/a3079566007-pixel/dsh-forage.git
-& $git -C "$env:USERPROFILE\.dsh\repos\dsh-forage" push -u origin main
+& $git -C "$env:USERPROFILE\.dsh\repos\dsh-forage" push origin main --tags
 ```
 
-3. 若仍超时，先给 git 配一个可用代理（端口按你的客户端改）：
+## 备选：GitHub 网页 / PAT
 
-```powershell
-& $git config --global http.https://github.com.proxy http://127.0.0.1:7890
-```
+- 网页建仓并加 Deploy key（Settings → Deploy keys，勾 Allow write）；
+- 或使用 PAT：`gh auth login --with-token`，或 `git credential approve`。
 
-## 发布到 Gitee（备选，国内直连可用）
+## 发布检查清单
 
-```powershell
-& $git -C "$env:USERPROFILE\.dsh\repos\dsh-forage" remote add origin https://gitee.com/a3079566007-pixel/dsh-forage.git
-& $git -C "$env:USERPROFILE\.dsh\repos\dsh-forage" push -u origin main
-```
-
-## 发布到 npm（可选）
-
-```powershell
-cd "$env:USERPROFILE\.dsh\repos\dsh-forage"
-npm publish --access public
-```
-
-## 名称可用性（2026-10-25 实测）
-
-- npm：`dsh-forage` 未占用（404）
-- DSH 插件目录：无同名条目
-- GitHub 仓库搜索：`dsh-forage` 0 个结果
-- 对照：`dsh-harvest` 已被 @stifer/dsh-harvest 占用（catalog + 8 个同名仓库）
+- [x] README / LICENSE / CHANGELOG / .gitignore
+- [x] 包元数据（repository / homepage / bugs / keywords）
+- [x] 默认分支 main
+- [x] tag v0.1.0 + Release notes
+- [x] topics
+- [ ] npm 发布（可选，需要 npm 账号）
