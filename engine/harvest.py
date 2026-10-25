@@ -315,11 +315,16 @@ def unique_frames(frames: list[Path], min_distance: int = 6) -> list[Path]:
     return kept
 
 
-def extract_frames(video: Path, outdir: Path, threshold: float, max_frames: int) -> list[Path]:
+def extract_frames(video: Path, outdir: Path, threshold: float, max_frames: int, mode: str = "scene") -> list[Path]:
     outdir.mkdir(parents=True, exist_ok=True)
     for old in outdir.glob("*.jpg"):
         old.unlink()
     pattern = str(outdir / "f_%03d.jpg")
+    if mode == "ui":
+        vf = "fps=1/7,scale=1920:-2"
+        cp = run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video),
+                  "-vf", vf, "-frames:v", str(max(max_frames, 40)), pattern])
+        return unique_frames(sorted(outdir.glob("f_*.jpg")), min_distance=2)
     vf = f"select='gt(scene,{min(threshold, 0.18)})',scale=1920:-2"
     cp = run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video),
               "-vf", vf, "-vsync", "vfr", "-frames:v", str(max(max_frames, 40)), pattern])
@@ -456,7 +461,9 @@ def ingest(vid: str, asr: bool = True, frames: bool = False, model: str | None =
         video = download_video(url, work)
         cfg = profile().get("ocr", {})
         fdir = work / "frames"
-        frames_list = extract_frames(video, fdir, float(cfg.get("scene_threshold", 0.25)), int(cfg.get("max_frames", 24)))
+        vtype = classify_video(row["title"], row["description"])
+        mode = "ui" if vtype in ("tutorial", "course") else "scene"
+        frames_list = extract_frames(video, fdir, float(cfg.get("scene_threshold", 0.25)), int(cfg.get("max_frames", 24)), mode)
         print(f"[ingest] {len(frames_list)} 帧，OCR ...")
         text, per = ocr_frames(frames_list, float(cfg.get("min_conf", 0.5)))
         (work / "ocr.txt").write_text(text, encoding="utf-8")
