@@ -1,0 +1,5 @@
+{
+  "base_url": "https://api.siliconflow.cn/v1",
+  "api_key": "sk-eozjqaxjnnxoelzrolebovfbiqskjzmwdwqkapiomyaqsycb",
+  "model": "Qwen/Qwen3-VL-30B-A3B-Instruct"
+}

@@ -550,8 +550,9 @@ def ingest(vid: str, asr: bool = True, frames: bool = False, model: str | None =
             try:
                 items = json.loads(manifest.read_text(encoding="utf-8"))
                 n = 0
+                cap_types = ("diagram", "slide", "code/text") if vtype in ("tutorial", "course") else ("diagram", "slide")
                 for it in items:
-                    if it.get("type") in ("diagram", "slide") and n < 20:
+                    if it.get("type") in cap_types and n < 20:
                         cap = caption_frame(fdir / it["file"], vlm)
                         if cap:
                             it["caption"] = cap
@@ -1078,6 +1079,40 @@ def cmd_learn(a) -> None:
     conn.close()
 
 
+def cmd_caption(a) -> None:
+    cfg = load_vlm_config()
+    if not cfg:
+        print("未配置视觉模型：写 ~/.dsh/harvest/vlm.json 或设 VLM_BASE_URL/VLM_API_KEY/VLM_MODEL")
+        return
+    conn = db()
+    ids = a.ids or [r["id"] for r in conn.execute("SELECT id FROM videos WHERE frames_dir IS NOT NULL AND frames_dir<>''").fetchall()]
+    conn.close()
+    for vid in ids:
+        work = MEDIA / re.sub(r"[^A-Za-z0-9_.-]", "_", vid) / "frames"
+        man = work / "manifest.json"
+        if not man.exists():
+            print("  " + vid + " 无 manifest")
+            continue
+        items = json.loads(man.read_text(encoding="utf-8"))
+        conn = db()
+        row = conn.execute("SELECT * FROM videos WHERE id=?", (vid,)).fetchone()
+        conn.close()
+        vtype = classify_video(row["title"], row["description"]) if row else "concept"
+        cap_types = ("diagram", "slide", "code/text") if vtype in ("tutorial", "course") else ("diagram", "slide")
+        n = 0
+        for it in items:
+            if it.get("type") not in cap_types:
+                continue
+            if n >= int(a.limit):
+                break
+            cap = caption_frame(work / it["file"], cfg)
+            if cap:
+                it["caption"] = cap
+                n += 1
+        man.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("  " + vid + " 图注 " + str(n) + " 张")
+
+
 def cmd_pass(a) -> None:
     conn = db()
     if not conn.execute("SELECT 1 FROM videos WHERE id=?", (a.id,)).fetchone():
@@ -1200,6 +1235,11 @@ def main() -> None:
     sp.add_argument("--run", action="store_true")
     sp.add_argument("--workers", type=int, default=3)
     sp.set_defaults(func=cmd_learn)
+
+    sp = sub.add_parser("caption", help="给已有帧生成图注（需配置视觉模型）")
+    sp.add_argument("--ids", nargs="*")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.set_defaults(func=cmd_caption)
 
     sp = sub.add_parser("audit", help="按类型 rubric 做验收自检")
     sp.add_argument("--ids", nargs="*")
