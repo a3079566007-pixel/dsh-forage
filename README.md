@@ -1,5 +1,6 @@
 # dsh-forage · 采源
 
+[![CI](https://github.com/a3079566007-pixel/dsh-forage/actions/workflows/ci.yml/badge.svg)](https://github.com/a3079566007-pixel/dsh-forage/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![npm](https://img.shields.io/badge/package-0.1.0-blue)](package.json)
 
