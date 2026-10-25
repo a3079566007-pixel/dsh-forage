@@ -321,10 +321,10 @@ def extract_frames(video: Path, outdir: Path, threshold: float, max_frames: int,
         old.unlink()
     pattern = str(outdir / "f_%03d.jpg")
     if mode == "ui":
-        vf = "fps=1/7,scale=1920:-2"
+        vf = "fps=1/6,scale=1920:-2"
         cp = run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video),
                   "-vf", vf, "-frames:v", str(max(max_frames, 40)), pattern])
-        return unique_frames(sorted(outdir.glob("f_*.jpg")), min_distance=2)
+        return sorted(outdir.glob("f_*.jpg"))
     vf = f"select='gt(scene,{min(threshold, 0.18)})',scale=1920:-2"
     cp = run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video),
               "-vf", vf, "-vsync", "vfr", "-frames:v", str(max(max_frames, 40)), pattern])
@@ -363,6 +363,78 @@ def classify_frame(path: Path, ocr_lines: int) -> str:
     if edge_ratio >= 0.03:
         return "diagram"
     return "other"
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def ocr_ui_frames(frames, min_conf: float):
+    from rapidocr_onnxruntime import RapidOCR
+    engine = RapidOCR()
+    per = []
+    for f in frames:
+        try:
+            result, _ = engine(str(f))
+        except Exception:
+            continue
+        texts = []
+        for _, txt, conf in (result or []):
+            txt = (txt or "").strip()
+            if txt and len(txt) >= 2 and conf >= min_conf:
+                texts.append(txt)
+        if texts:
+            per.append({"frame": f.name, "text": texts})
+    kept = []
+    for item in per:
+        s = set(item["text"])
+        if any(_jaccard(s, set(k["text"])) >= 0.9 for k in kept):
+            continue
+        kept.append(item)
+    text = "\n".join(dict.fromkeys(x for k in kept for x in k["text"]))
+    return text, kept
+
+
+def load_vlm_config():
+    import os
+    cfg = {}
+    path = HOME / "vlm.json"
+    if path.exists():
+        try:
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+    base = os.environ.get("VLM_BASE_URL") or cfg.get("base_url")
+    key = os.environ.get("VLM_API_KEY") or cfg.get("api_key")
+    model = os.environ.get("VLM_MODEL") or cfg.get("model")
+    if not (base and key and model):
+        return None
+    return {"base_url": base.rstrip("/"), "api_key": key, "model": model}
+
+
+def caption_frame(fp: Path, cfg: dict):
+    import base64
+    import requests
+    try:
+        b64 = base64.b64encode(fp.read_bytes()).decode()
+        payload = {
+            "model": cfg["model"],
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}},
+                {"type": "text", "text": "先用一句话说明这张图在讲什么，再逐行列出图中出现的功能、模块、参数或步骤。只输出内容，不要客套。"},
+            ]}],
+            "max_tokens": 220,
+        }
+        r = requests.post(cfg["base_url"] + "/chat/completions",
+                          headers={"Authorization": "Bearer " + cfg["api_key"], "Content-Type": "application/json"},
+                          json=payload, timeout=60)
+        if r.status_code != 200:
+            return None
+        return (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "").strip()[:500]
+    except Exception:
+        return None
 
 
 def write_manifest(work: Path, frames: list[Path], per_frame: list[dict]) -> Path:
@@ -465,10 +537,29 @@ def ingest(vid: str, asr: bool = True, frames: bool = False, model: str | None =
         mode = "ui" if vtype in ("tutorial", "course") else "scene"
         frames_list = extract_frames(video, fdir, float(cfg.get("scene_threshold", 0.25)), int(cfg.get("max_frames", 24)), mode)
         print(f"[ingest] {len(frames_list)} 帧，OCR ...")
-        text, per = ocr_frames(frames_list, float(cfg.get("min_conf", 0.5)))
+        if mode == "ui":
+            text, per = ocr_ui_frames(frames_list, float(cfg.get("min_conf", 0.5)))
+            frames_list = [fdir / x["frame"] for x in per]
+        else:
+            text, per = ocr_frames(frames_list, float(cfg.get("min_conf", 0.5)))
         (work / "ocr.txt").write_text(text, encoding="utf-8")
         (work / "ocr.json").write_text(json.dumps(per, ensure_ascii=False), encoding="utf-8")
         manifest = write_manifest(work, frames_list, per)
+        vlm = load_vlm_config()
+        if vlm:
+            try:
+                items = json.loads(manifest.read_text(encoding="utf-8"))
+                n = 0
+                for it in items:
+                    if it.get("type") in ("diagram", "slide") and n < 20:
+                        cap = caption_frame(fdir / it["file"], vlm)
+                        if cap:
+                            it["caption"] = cap
+                            n += 1
+                manifest.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+                print("[ingest] 图注 " + str(n) + " 张")
+            except Exception as e:
+                print("[ingest] 图注失败: " + str(e)[:80])
         conn.execute("UPDATE videos SET ocr_text=?, frames_dir=? WHERE id=?", (text, str(fdir), vid))
         conn.commit()
 
@@ -514,7 +605,8 @@ def digest(vid: str, max_chars: int, quiet: bool = False) -> str:
                 lines = ["", "## 图文资产（" + str(len(items)) + " 帧）"]
                 for it in items[:24]:
                     snippet = " / ".join(it.get("ocr", []))[:60]
-                    lines.append("- [" + it.get("type", "") + "] t≈" + str(it.get("approx_second", 0)) + "s " + snippet + " (" + str(Path(r["frames_dir"]) / it["file"]) + ")")
+                    cap = (" | " + it["caption"][:100]) if it.get("caption") else ""
+                    lines.append("- [" + it.get("type", "") + "] t≈" + str(it.get("approx_second", 0)) + "s " + snippet + cap + " (" + str(Path(r["frames_dir"]) / it["file"]) + ")")
                 parts += lines
             except Exception:
                 pass
