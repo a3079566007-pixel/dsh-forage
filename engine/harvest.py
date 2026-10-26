@@ -84,6 +84,11 @@ def db() -> sqlite3.Connection:
         kind TEXT, text TEXT, model TEXT, dim INTEGER, emb BLOB
     );
     CREATE INDEX IF NOT EXISTS idx_chunks_video ON chunks(video_id);
+    CREATE TABLE IF NOT EXISTS memories (
+        id TEXT PRIMARY KEY, source_id TEXT, kind TEXT, title TEXT, url TEXT,
+        summary TEXT, key_points TEXT, concepts TEXT, questions TEXT,
+        study_path TEXT, created_at INTEGER, model TEXT, dim INTEGER, emb BLOB
+    );
     """)
     try:
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS videos_fts USING fts5(id UNINDEXED, title, description, transcript, ocr_text, summary, tokenize='trigram')")
@@ -641,6 +646,7 @@ def note(vid: str, summary: str, tags: str | None, json_text: str | None) -> Non
     conn.commit()
     fts_sync(conn, vid)
     conn.close()
+    save_memory(vid, summary)
     if JSON_MODE:
         emit({"ok": True, "id": vid})
     else:
@@ -812,6 +818,94 @@ def cmd_import_notes(a) -> None:
     conn.commit()
     conn.close()
     print("imported notes: " + str(n))
+
+
+def save_memory(source_id: str, summary: str, concepts: str = "", questions: str = "", kind: str = "study"):
+    import numpy as np
+    conn = db()
+    row = conn.execute("SELECT * FROM videos WHERE id=?", (source_id,)).fetchone()
+    if not row or not (summary or "").strip():
+        conn.close()
+        return None
+    title = row["title"] or source_id
+    out_dir = HOME / "learning"
+    out_dir.mkdir(exist_ok=True)
+    safe = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", title)[:60]
+    study = out_dir / (safe + ".md")
+    study.write_text("# " + title + "\n\n- 源：" + (row["url"] or "") + "\n- 时长：" + str(round((row["duration"] or 0) / 60)) + " 分钟\n- 学习时间：" + time.strftime("%Y-%m-%d") + "\n\n" + summary, encoding="utf-8")
+    cfg = load_embed_config()
+    emb = None
+    model = dim = None
+    if cfg:
+        try:
+            vec = embed_texts(cfg, [title + "\n" + summary])[0]
+            emb = np.asarray(vec, dtype="float32").tobytes()
+            model, dim = cfg["model"], len(vec)
+        except Exception:
+            pass
+    mid = "mem:" + source_id
+    conn.execute("""INSERT INTO memories (id, source_id, kind, title, url, summary, key_points, concepts, questions, study_path, created_at, model, dim, emb)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET summary=excluded.summary, key_points=excluded.key_points,
+                    concepts=excluded.concepts, questions=excluded.questions, study_path=excluded.study_path,
+                    created_at=excluded.created_at, model=excluded.model, dim=excluded.dim, emb=excluded.emb""",
+                 (mid, source_id, kind, title, row["url"], summary, "", concepts, questions,
+                  str(study), int(time.time()), model, dim, emb))
+    conn.commit()
+    conn.close()
+    return {"id": mid, "study": str(study)}
+
+
+def cmd_memory(a) -> None:
+    summary = Path(a.summary_file).read_text(encoding="utf-8") if a.summary_file else None
+    if summary is None:
+        conn = db()
+        row = conn.execute("SELECT summary FROM videos WHERE id=?", (a.id,)).fetchone()
+        conn.close()
+        summary = (row["summary"] if row else "") or ""
+    saved = save_memory(a.id, summary, a.concepts or "", a.questions or "", a.kind or "study")
+    if not saved:
+        print("nothing saved (missing video or empty summary)")
+        return
+    if JSON_MODE:
+        emit({"ok": True, "id": saved["id"], "study": saved["study"]})
+    else:
+        print("memory saved: " + saved["id"])
+        print("study copy: " + saved["study"])
+
+
+def cmd_recall(a) -> None:
+    import numpy as np
+    conn = db()
+    rows = conn.execute("SELECT * FROM memories").fetchall()
+    cfg = load_embed_config()
+    scored = []
+    if rows and cfg:
+        try:
+            qv = np.asarray(embed_texts(cfg, [a.query])[0], dtype="float32")
+            qn = np.linalg.norm(qv) or 1
+            for r in rows:
+                if not r["emb"]:
+                    continue
+                v = np.frombuffer(r["emb"], dtype="float32")
+                sim = float(v @ qv / ((np.linalg.norm(v) or 1) * qn))
+                scored.append((sim, r))
+            scored.sort(key=lambda x: -x[0])
+        except Exception:
+            scored = []
+    if not scored:
+        for r in rows:
+            if a.query in (r["summary"] or "") or a.query in (r["title"] or ""):
+                scored.append((0.0, r))
+    out = []
+    for sim, r in scored[: int(a.limit or 5)]:
+        out.append({"id": r["id"], "title": r["title"], "url": r["url"], "score": round(sim, 4),
+                    "summary": (r["summary"] or "")[:200], "study_path": r["study_path"]})
+        print("- [" + str(round(sim, 3)) + "] " + r["title"])
+        print("  " + (r["summary"] or "")[:120].replace("\n", " "))
+        print("  " + (r["study_path"] or ""))
+    if JSON_MODE:
+        emit({"ok": True, "query": a.query, "results": out})
 
 
 def cmd_find(a) -> None:
@@ -1504,6 +1598,20 @@ def main() -> None:
     sp.add_argument("--run", action="store_true")
     sp.add_argument("--workers", type=int, default=1)
     sp.set_defaults(func=cmd_learn)
+
+    sp = sub.add_parser("memory", help="把一份内容的摘要写成学习稿+AI记忆")
+    sp.add_argument("--id", required=True)
+    sp.add_argument("--summary-file", default=None)
+    sp.add_argument("--kind", default="study")
+    sp.add_argument("--concepts", default="")
+    sp.add_argument("--questions", default="")
+    sp.add_argument("--key-points", default="")
+    sp.set_defaults(func=cmd_memory)
+
+    sp = sub.add_parser("recall", help="语义检索记忆库")
+    sp.add_argument("--query", required=True)
+    sp.add_argument("--limit", type=int, default=5)
+    sp.set_defaults(func=cmd_recall)
 
     sp = sub.add_parser("find", help="概念检索视频：关键词召回后用向量重排")
     sp.add_argument("--query", required=True)
