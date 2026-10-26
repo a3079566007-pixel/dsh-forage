@@ -755,6 +755,65 @@ def build_chunks(row):
     return chunks
 
 
+def parse_frontmatter(text: str):
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}, text
+    head, body = text[3:end], text[end + 4:]
+    meta = {}
+    for line in head.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        val = val.strip()
+        try:
+            meta[key.strip()] = json.loads(val)
+        except Exception:
+            meta[key.strip()] = val.strip('"')
+    return meta, body.lstrip("\n")
+
+
+def cmd_import_notes(a) -> None:
+    root = Path(a.dir)
+    files = sorted(root.glob("*.md")) if root.exists() else []
+    if not files:
+        print("no markdown notes under " + str(root))
+        return
+    conn = db()
+    n = 0
+    for fp in files:
+        text = fp.read_text(encoding="utf-8")
+        meta, body = parse_frontmatter(text)
+        aweme = str(meta.get("aweme_id") or "").strip()
+        if not aweme:
+            m = re.search(r"(\d{6,30})", str(meta.get("play_url") or ""))
+            aweme = m.group(1) if m else ""
+        if not aweme:
+            continue
+        title = str(meta.get("title") or meta.get("description") or aweme)[:200]
+        url = "https://www.douyin.com/video/" + aweme
+        vid = "douyin:" + aweme
+        transcript = (meta.get("transcript") or "")
+        if not transcript:
+            transcript = body.strip()[:20000]
+        duration = int(float(meta.get("duration_seconds") or 0))
+        author = str(meta.get("author") or "")
+        conn.execute("""INSERT INTO videos (id, platform, bvid, url, title, author, duration, pubdate, play, like_,
+                        description, tags, query, score, status, added_at, transcript, transcript_src)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(id) DO UPDATE SET transcript=coalesce(nullif(excluded.transcript,''),videos.transcript),
+                        status=CASE WHEN videos.status='new' THEN 'ingested' ELSE videos.status END""",
+                     (vid, "douyin", aweme, url, title, author, duration, 0, 0, 0,
+                      str(meta.get("description") or "")[:2000], "[]", "douyin-notes", 0, "ingested", int(time.time()),
+                      transcript, str(meta.get("transcript_source") or "douyin-notes")))
+        n += 1
+    conn.commit()
+    conn.close()
+    print("imported notes: " + str(n))
+
+
 def cmd_index(a) -> None:
     cfg = load_embed_config()
     if not cfg:
@@ -989,8 +1048,11 @@ def cmd_import(a) -> None:
         conn.commit()
         fts_sync(conn, vid)
     conn.close()
-    print("imported:", vid)
+    if not JSON_MODE:
+        print("imported:", vid)
     ingest(vid, asr=not a.no_asr, frames=a.frames, model=a.model)
+    if JSON_MODE:
+        emit({"ok": True, "id": vid})
 
 
 def cmd_digest(a) -> None:
@@ -1388,8 +1450,12 @@ def main() -> None:
     sp.add_argument("--types", default="concept,tutorial,survey,interview,review")
     sp.add_argument("--out", default=None)
     sp.add_argument("--run", action="store_true")
-    sp.add_argument("--workers", type=int, default=3)
+    sp.add_argument("--workers", type=int, default=1)
     sp.set_defaults(func=cmd_learn)
+
+    sp = sub.add_parser("import-notes", help="导入 douyin-favorites 知识库的 Markdown 笔记")
+    sp.add_argument("--dir", required=True)
+    sp.set_defaults(func=cmd_import_notes)
 
     sp = sub.add_parser("index", help="为素材建向量索引（需配置 embedding）")
     sp.set_defaults(func=cmd_index)
