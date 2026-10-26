@@ -78,6 +78,12 @@ def db() -> sqlite3.Connection:
     );
     CREATE INDEX IF NOT EXISTS idx_status ON videos(status);
     CREATE TABLE IF NOT EXISTS feedback (id TEXT, verdict TEXT, reason TEXT, at INTEGER);
+    CREATE TABLE IF NOT EXISTS chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        video_id TEXT, seq INTEGER, start_sec INTEGER, end_sec INTEGER,
+        kind TEXT, text TEXT, model TEXT, dim INTEGER, emb BLOB
+    );
+    CREATE INDEX IF NOT EXISTS idx_chunks_video ON chunks(video_id);
     """)
     try:
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS videos_fts USING fts5(id UNINDEXED, title, description, transcript, ocr_text, summary, tokenize='trigram')")
@@ -670,44 +676,193 @@ def _fuzzy(conn, q: str, limit: int):
     return out
 
 
-def kb_rows(conn, q: str, limit: int):
-    """带权重的本地检索：摘要/转写优先，标题只作辅助；要求词覆盖或二元组覆盖。"""
-    tokens = [x for x in re.split(r"\s+", q.strip()) if x]
-    base = re.sub(r"\s+", "", q)
-    shingles = list(dict.fromkeys(base[i:i + 2] for i in range(len(base) - 1))) if len(base) >= 2 else []
-    rows = conn.execute("SELECT * FROM videos").fetchall()
-    scored = []
-    for r in rows:
-        summary = r["summary"] or ""
-        trans = r["transcript"] or ""
-        ocr = r["ocr_text"] or ""
-        title = r["title"] or ""
-        desc = r["description"] or ""
-        strong = summary + " " + trans + " " + ocr
-        weak = title + " " + desc
-        token_hits = sum(1 for tok in tokens if tok in strong or tok in weak)
-        sh_hits = sum(1 for s in shingles if s in strong or s in weak)
-        cov = (sh_hits / len(shingles)) if shingles else 0.0
-        if not (token_hits == len(tokens) or cov >= 0.5):
-            continue
-        score = (token_hits / max(len(tokens), 1)) * 3.0 + cov * 2.0
-        if summary:
-            score += 1.5
-        score += min(math.log1p(r["play"] or 0) / 20.0, 0.5)
-        scored.append((score, r))
-    scored.sort(key=lambda x: -x[0])
+EMBED_CONFIG = HOME / "embed.json"
+
+
+def load_embed_config():
+    import os
+    cfg = {}
+    if EMBED_CONFIG.exists():
+        try:
+            cfg = json.loads(EMBED_CONFIG.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+    base = os.environ.get("EMBED_BASE_URL") or cfg.get("base_url")
+    key = os.environ.get("EMBED_API_KEY") or cfg.get("api_key")
+    model = os.environ.get("EMBED_MODEL") or cfg.get("model")
+    if not (base and key and model):
+        return None
+    return {"base_url": base.rstrip("/"), "api_key": key, "model": model}
+
+
+def embed_texts(cfg, texts):
+    import requests
     out = []
-    for _, r in scored[:limit]:
-        d = dict(zip(r.keys(), r))
-        src = d.get("summary") or d.get("transcript") or ""
-        pos = -1
-        for needle in tokens + shingles:
-            pos = src.find(needle)
-            if pos >= 0:
-                break
-        d["snip"] = src[max(0, pos - 30):pos + 110] if pos >= 0 else src[:120]
-        out.append(d)
+    for i in range(0, len(texts), 16):
+        batch = texts[i:i + 16]
+        r = requests.post(cfg["base_url"] + "/embeddings",
+                          headers={"Authorization": "Bearer " + cfg["api_key"], "Content-Type": "application/json"},
+                          json={"model": cfg["model"], "input": batch}, timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError("embedding failed: " + str(r.status_code) + " " + r.text[:160])
+        out.extend([d["embedding"] for d in r.json()["data"]])
     return out
+
+
+def parse_transcript(text: str):
+    lines = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^\s*\[(\d{1,2}):(\d{2})\]\s*(.+)$", line)
+        if m:
+            lines.append((int(m.group(1)) * 60 + int(m.group(2)), m.group(3).strip()))
+        elif line.strip():
+            lines.append((None, line.strip()))
+    return lines
+
+
+def build_chunks(row):
+    import json as _json
+    chunks = []
+    lines = parse_transcript(row["transcript"] or "")
+    cur, start = [], None
+    last_t = 0
+    for sec, text in lines:
+        if start is None:
+            start = sec if sec is not None else 0
+        cur.append(text)
+        if sec is not None:
+            last_t = sec
+        if sum(len(x) for x in cur) >= 380 or (sec is not None and sec - start >= 100):
+            chunks.append((start, last_t, "transcript", " ".join(cur)))
+            cur, start = [], None
+    if cur:
+        chunks.append((start or 0, last_t, "transcript", " ".join(cur)))
+    if row["summary"]:
+        chunks.append((0, row["duration"] or 0, "summary", row["summary"]))
+    if row["frames_dir"]:
+        man = Path(row["frames_dir"]) / "manifest.json"
+        if man.exists():
+            try:
+                for it in json.loads(man.read_text(encoding="utf-8")):
+                    parts = it.get("ocr") or []
+                    txt = " ".join(parts)[:300]
+                    if it.get("caption"):
+                        txt = (it["caption"] + " " + txt)[:400]
+                    if txt:
+                        chunks.append((it.get("approx_second", 0), it.get("approx_second", 0) + 20, "figure", txt))
+            except Exception:
+                pass
+    return chunks
+
+
+def cmd_index(a) -> None:
+    cfg = load_embed_config()
+    if not cfg:
+        print("未配置 embedding：写 ~/.dsh/harvest/embed.json 或设 EMBED_BASE_URL/EMBED_API_KEY/EMBED_MODEL")
+        return
+    conn = db()
+    rows = conn.execute("SELECT * FROM videos WHERE length(coalesce(transcript,''))>0 OR (summary IS NOT NULL AND summary<>'')").fetchall()
+    total = 0
+    for r in rows:
+        have = conn.execute("SELECT count(*) FROM chunks WHERE video_id=? AND model=?", (r["id"], cfg["model"])).fetchone()[0]
+        if have:
+            continue
+        items = build_chunks(r)
+        if not items:
+            continue
+        vecs = embed_texts(cfg, [x[3] for x in items])
+        for seq, ((s, e, kind, txt), v) in enumerate(zip(items, vecs)):
+            import numpy as np
+            conn.execute("INSERT INTO chunks (video_id, seq, start_sec, end_sec, kind, text, model, dim, emb) VALUES (?,?,?,?,?,?,?,?,?)",
+                         (r["id"], seq, s, e, kind, txt, cfg["model"], len(v), np.asarray(v, dtype="float32").tobytes()))
+        total += len(items)
+        print("  " + r["id"] + " chunks " + str(len(items)))
+        conn.commit()
+    conn.close()
+    print("indexed chunks: " + str(total))
+
+
+def semantic_rows(conn, q: str, limit: int, cfg: dict):
+    import numpy as np
+    rows = conn.execute("SELECT id, video_id, start_sec, kind, text, emb FROM chunks WHERE model=?", (cfg["model"],)).fetchall()
+    if not rows:
+        return []
+    qv = np.asarray(embed_texts(cfg, [q])[0], dtype="float32")
+    mat = np.vstack([np.frombuffer(r["emb"], dtype="float32") for r in rows])
+    norms = np.linalg.norm(mat, axis=1)
+    norms[norms == 0] = 1
+    sims = mat @ qv / (norms * (np.linalg.norm(qv) or 1))
+    order = np.argsort(-sims)[:60]
+    best = {}
+    for idx in order:
+        r = rows[int(idx)]
+        cur = best.get(r["video_id"])
+        if cur is None or sims[int(idx)] > cur[0]:
+            best[r["video_id"]] = (float(sims[int(idx)]), r)
+    # lexical ranks for fusion
+    fts_order = []
+    try:
+        tokens = [x for x in re.split(r"\s+", q.strip()) if x]
+        fts_q = " AND ".join('"' + tok.replace('"', "") + '"' for tok in tokens)
+        fts_order = [x["id"] for x in conn.execute(
+            "SELECT v.id FROM videos_fts JOIN videos v ON v.id=videos_fts.id WHERE videos_fts MATCH ? ORDER BY rank LIMIT 20",
+            (fts_q,)).fetchall()]
+    except Exception:
+        fts_order = []
+    fts_rank = {vid: i for i, vid in enumerate(fts_order)}
+    scored = []
+    for rank, (vid, (sim, r)) in enumerate(sorted(best.items(), key=lambda kv: -kv[1][0])):
+        score = 1.0 / (60 + rank)
+        if vid in fts_rank:
+            score += 1.0 / (60 + fts_rank[vid])
+        scored.append((score, vid, sim, r))
+    scored.sort(key=lambda x: -x[0])
+    import numpy as np2
+    out = []
+    for score, vid, sim, r in scored[:limit]:
+        v = conn.execute("SELECT id,title,url,author,duration FROM videos WHERE id=?", (vid,)).fetchone()
+        if not v:
+            continue
+        out.append({"id": v["id"], "title": v["title"], "url": v["url"], "author": v["author"],
+                    "duration": v["duration"], "start_sec": r["start_sec"], "kind": r["kind"],
+                    "score": round(score, 4), "sim": round(sim, 4),
+                    "snip": "[" + str(r["start_sec"] // 60).zfill(2) + ":" + str(r["start_sec"] % 60).zfill(2) + "] " + (r["text"] or "")[:180]})
+    return out
+
+
+def kb_rows(conn, q: str, limit: int):
+    cfg = load_embed_config()
+    if cfg:
+        try:
+            sem = semantic_rows(conn, q, limit, cfg)
+            if sem:
+                return sem
+        except Exception:
+            pass
+    rows = []
+    tokens = [x for x in re.split(r"\s+", q.strip()) if x]
+    try:
+        fts_q = " AND ".join('"' + t.replace('"', "") + '"' for t in tokens)
+        rows = conn.execute("""SELECT v.*, snippet(videos_fts, 1, '[', ']', '…', 16) AS snip
+                               FROM videos_fts JOIN videos v ON v.id = videos_fts.id
+                               WHERE videos_fts MATCH ? ORDER BY rank LIMIT ?""", (fts_q, limit)).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    if not rows:
+        clause = " OR ".join(["(title LIKE ? OR description LIKE ? OR transcript LIKE ? OR ocr_text LIKE ? OR summary LIKE ?)"] * len(tokens))
+        params = []
+        for tok in tokens:
+            params += [f"%{tok}%"] * 5
+        rows = conn.execute(f"SELECT *, substr(coalesce(transcript,''),1,120) AS snip FROM videos WHERE {clause} ORDER BY score DESC LIMIT ?",
+                            (*params, limit)).fetchall()
+    if not rows:
+        picked = []
+        for item in _fuzzy(conn, q, limit):
+            d = item if isinstance(item, dict) else dict(zip(item.keys(), item))
+            d["snip"] = (d.get("transcript") or d.get("summary") or "")[:120]
+            picked.append(d)
+        rows = picked
+    return rows
 
 
 def search_kb(q: str, limit: int) -> None:
@@ -1235,6 +1390,9 @@ def main() -> None:
     sp.add_argument("--run", action="store_true")
     sp.add_argument("--workers", type=int, default=3)
     sp.set_defaults(func=cmd_learn)
+
+    sp = sub.add_parser("index", help="为素材建向量索引（需配置 embedding）")
+    sp.set_defaults(func=cmd_index)
 
     sp = sub.add_parser("caption", help="给已有帧生成图注（需配置视觉模型）")
     sp.add_argument("--ids", nargs="*")
