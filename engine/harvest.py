@@ -814,6 +814,58 @@ def cmd_import_notes(a) -> None:
     print("imported notes: " + str(n))
 
 
+def cmd_find(a) -> None:
+    q = a.query
+    limit = int(a.limit or 8)
+    rows = []
+    try:
+        rows = bili_search(q, page=1)
+    except Exception as e:
+        if not JSON_MODE:
+            print("[find] bilibili search failed: " + str(e)[:100])
+    cfg = load_embed_config()
+    scored = []
+    if rows and cfg:
+        try:
+            texts = [(r["title"] + " " + (r["description"] or "")[:160]) for r in rows]
+            vecs = embed_texts(cfg, texts)
+            qv = embed_texts(cfg, [q])[0]
+            import numpy as np
+            qa = np.asarray(qv, dtype="float32")
+            qn = np.linalg.norm(qa) or 1
+            for r, v in zip(rows, vecs):
+                va = np.asarray(v, dtype="float32")
+                sim = float(va @ qa / ((np.linalg.norm(va) or 1) * qn))
+                scored.append((sim, r))
+            scored.sort(key=lambda x: -x[0])
+        except Exception:
+            scored = [(0.0, r) for r in rows]
+    else:
+        scored = [(0.0, r) for r in rows]
+    results = []
+    for sim, r in scored[:limit]:
+        results.append({"id": "bili:" + r["bvid"], "title": r["title"], "url": r["url"],
+                        "author": r["author"], "duration": r["duration"],
+                        "concept_score": round(sim, 4)})
+    local = []
+    try:
+        conn = db()
+        local = [{"id": x["id"], "title": x["title"], "url": x["url"]} for x in kb_rows(conn, q, 3)]
+        conn.close()
+    except Exception:
+        local = []
+    if JSON_MODE:
+        emit({"ok": True, "query": q, "results": results, "local": local})
+    else:
+        for i, r in enumerate(results, 1):
+            print(str(i) + ". [" + str(r["concept_score"]) + "] " + r["title"][:60])
+            print("   " + r["author"] + " | " + str(round((r["duration"] or 0) / 60)) + "m | " + r["url"])
+        if local:
+            print("本地命中:")
+            for x in local:
+                print("  - " + x["title"][:50])
+
+
 def cmd_index(a) -> None:
     cfg = load_embed_config()
     if not cfg:
@@ -1452,6 +1504,11 @@ def main() -> None:
     sp.add_argument("--run", action="store_true")
     sp.add_argument("--workers", type=int, default=1)
     sp.set_defaults(func=cmd_learn)
+
+    sp = sub.add_parser("find", help="概念检索视频：关键词召回后用向量重排")
+    sp.add_argument("--query", required=True)
+    sp.add_argument("--limit", type=int, default=8)
+    sp.set_defaults(func=cmd_find)
 
     sp = sub.add_parser("import-notes", help="导入 douyin-favorites 知识库的 Markdown 笔记")
     sp.add_argument("--dir", required=True)
