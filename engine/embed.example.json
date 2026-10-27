@@ -1,5 +1,5 @@
 {
-  "base_url": "https://api.siliconflow.cn/v1",
-  "api_key": "sk-eozjqaxjnnxoelzrolebovfbiqskjzmwdwqkapiomyaqsycb",
-  "model": "BAAI/bge-m3"
+  "provider": "local",
+  "model": "bge-small-zh-v1.5",
+  "path": "C:/Users/<you>/.dsh/harvest/models/bge-small-zh-v1.5"
 }

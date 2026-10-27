@@ -1,6 +1,9 @@
 ---
 name: video-harvest
 description: 采源 —— 主动用概念检索找视频/文本，加工成知识：forage_find 概念召回 → add 加链接 → 转写/图注 → 摘要 → 概念检索；收藏夹视频用 douyin-favorites 导出后 import-notes。顺序执行，不做批量并行。当用户说"学一下XX""帮我找些讲XX的视频并总结""把这些视频整理成知识"时使用。
+metadata:
+  category: knowledge
+  subcategory: 知识管理/视频采集/采源
 ---
 
 # 采源（主动概念检索 + 单条加工）
@@ -38,7 +41,7 @@ python $H index
 
 ## 三、检索与配置
 
-- `embed.json`：bge-m3 向量（概念命中）；没有则退回字面检索；
+- `embed.json`：默认本地 ONNX `bge-small-zh-v1.5`（512 维，离线、免费）；也可切回 API bge-m3（1024 维，质量更高，走 SiliconFlow）；没有则退回字面检索；
 - `vlm.json`：图注；
 - `rubrics.yaml`：验收判据；
 - 新增内容后跑 `index` 补向量。

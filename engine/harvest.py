@@ -420,6 +420,8 @@ def load_vlm_config():
     base = os.environ.get("VLM_BASE_URL") or cfg.get("base_url")
     key = os.environ.get("VLM_API_KEY") or cfg.get("api_key")
     model = os.environ.get("VLM_MODEL") or cfg.get("model")
+    if cfg.get("provider") == "local" and cfg.get("path") and cfg.get("model"):
+        return {"provider": "local", "path": cfg["path"], "model": cfg["model"]}
     if not (base and key and model):
         return None
     return {"base_url": base.rstrip("/"), "api_key": key, "model": model}
@@ -693,15 +695,49 @@ def load_embed_config():
             cfg = json.loads(EMBED_CONFIG.read_text(encoding="utf-8"))
         except Exception:
             cfg = {}
+    if cfg.get("provider") == "local" and cfg.get("path") and cfg.get("model"):
+        return {"provider": "local", "path": cfg["path"], "model": cfg["model"]}
     base = os.environ.get("EMBED_BASE_URL") or cfg.get("base_url")
     key = os.environ.get("EMBED_API_KEY") or cfg.get("api_key")
     model = os.environ.get("EMBED_MODEL") or cfg.get("model")
     if not (base and key and model):
         return None
-    return {"base_url": base.rstrip("/"), "api_key": key, "model": model}
+    return {"provider": "api", "base_url": base.rstrip("/"), "api_key": key, "model": model}
+
+
+_LOCAL_CACHE = {}
+
+
+def local_embed_texts(cfg, texts):
+    import numpy as np
+    from tokenizers import Tokenizer
+    import onnxruntime as ort
+    key = cfg.get("model") or "local"
+    if key not in _LOCAL_CACHE:
+        p = Path(cfg["path"])
+        tok = Tokenizer.from_file(str(p / "tokenizer.json"))
+        tok.enable_truncation(max_length=512)
+        tok.enable_padding(length=None, pad_id=0, pad_token="[PAD]")
+        sess = ort.InferenceSession(str(p / "model.onnx"), providers=["CPUExecutionProvider"])
+        _LOCAL_CACHE[key] = (tok, sess)
+    tok, sess = _LOCAL_CACHE[key]
+    encs = tok.encode_batch(list(texts))
+    ids = np.asarray([e.ids for e in encs], dtype="int64")
+    mask = np.asarray([e.attention_mask for e in encs], dtype="int64")
+    feeds = {"input_ids": ids, "attention_mask": mask}
+    names = [i.name for i in sess.get_inputs()]
+    if "token_type_ids" in names:
+        feeds["token_type_ids"] = np.zeros_like(ids)
+    out = sess.run(None, feeds)[0]
+    vec = out[:, 0, :]
+    norm = np.linalg.norm(vec, axis=1, keepdims=True)
+    norm[norm == 0] = 1
+    return (vec / norm).tolist()
 
 
 def embed_texts(cfg, texts):
+    if cfg.get("provider") == "local":
+        return local_embed_texts(cfg, texts)
     import requests
     out = []
     for i in range(0, len(texts), 16):
